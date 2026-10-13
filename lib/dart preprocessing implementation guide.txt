@@ -1,0 +1,171 @@
+# NSL Model — Flutter/Dart Implementation Guide
+
+This document describes exactly how the model was trained, so the Dart-side
+preprocessing and inference code produces inputs identical to training. Any
+deviation here reintroduces the train/inference mismatch that caused the
+original bug (99% val accuracy, near-random real-world accuracy).
+
+## 1. Model files
+
+- `mobilenetv3small_single_fp16.tflite` — float16 weights, **float32 input/output**.
+- `mobilenetv3small_single_int8.tflite` — full integer quantization, **uint8 input/output**.
+
+These two files expect **different input dtypes**. Pick one and match its
+dtype exactly:
+
+| Model | Input dtype | Input range | Output dtype | Output |
+|---|---|---|---|---|
+| FP16 | `float32` | `[0.0, 1.0]` | `float32` | softmax probabilities, 36 values |
+| INT8 | `uint8` | `[0, 255]` | `uint8` | quantized probabilities, 36 values (dequantize using the model's output scale/zero-point to get real probabilities) |
+
+Before writing Dart code: run `interpreter.get_input_details()` /
+`get_output_details()` (or the Dart/TFLite equivalent) on whichever file is
+actually bundled in the app, and confirm shape `[1, 96, 96, 1]` and the dtype
+above. Do not assume — verify against the actual file.
+
+## 2. Preprocessing pipeline (must match exactly)
+
+Applied to every image, in this exact order, both in Python training and in
+Dart at inference time:
+
+1. **Grayscale conversion.** Convert the color camera frame to single-channel
+   grayscale (standard luminance conversion — OpenCV's `COLOR_BGR2GRAY` /
+   equivalent standard RGB-to-gray weights). If the camera plugin already
+   gives you a YUV frame, the Y-plane is already this grayscale — no extra
+   conversion needed, just confirm it's full-range 0–255 and not gamma-shifted
+   differently from what OpenCV produces.
+
+2. **Histogram equalization.** OpenCV `cv2.equalizeHist()` — global histogram
+   equalization on the grayscale image. This is not CLAHE (adaptive/local
+   equalization) — it's the plain global version. If your Dart/native image
+   library only offers CLAHE, this is a mismatch; use a plain histogram
+   equalization implementation instead.
+
+3. **Adaptive threshold.** OpenCV `cv2.adaptiveThreshold()` with these exact
+   parameters:
+   - method: `ADAPTIVE_THRESH_GAUSSIAN_C`
+   - threshold type: `THRESH_BINARY_INV` (foreground/hand becomes white/255,
+     background becomes black/0 — inverted from plain binary)
+   - block size: `11`
+   - C: `2`
+
+   If Dart has to reimplement this manually (no direct OpenCV binding), it
+   must replicate: for each pixel, compute a Gaussian-weighted mean of the
+   11×11 neighborhood, subtract `C=2`, and threshold — pixel becomes 255 if
+   original value < (local mean − C), else 0. Getting the block size/C wrong
+   changes how much of the hand silhouette survives thresholding, which
+   directly affects the crop step next.
+
+4. **Bounding-box crop of the foreground.** Find all non-zero (white, i.e.
+   foreground) pixel coordinates in the thresholded image and crop to their
+   bounding rectangle (OpenCV `findNonZero` + `boundingRect`). If no
+   foreground pixels are found (all-black frame), fall back to using the
+   full uncropped thresholded image rather than crashing.
+
+   **Important Dart-specific risk:** the crop is not square — it's whatever
+   rectangle bounds the hand. Step 5 resizes this directly to 96×96, which
+   means non-square crops get **stretched**, not letterboxed. If your
+   MediaPipe hand-detection crop upstream already produces a different
+   aspect ratio or padding behavior than this raw bounding-box approach, you
+   will get different stretching than training saw. Confirm whether the app
+   is meant to use MediaPipe's hand box (different from this
+   threshold-derived box) or this adaptive-threshold-derived box — they can
+   disagree, and only one of them matches what the model was trained on.
+
+5. **Resize to 96×96.** Direct resize (no padding, no letterboxing) using an
+   area-based interpolation (OpenCV `INTER_AREA`, used for downscaling).
+   Whatever Dart image-resize function is used, prefer an averaging/area
+   method over nearest-neighbor for closest match, since nearest-neighbor on
+   a binary image will alias edges differently.
+
+6. **Normalize.**
+   - For the **FP16 model**: divide by 255.0 to get `float32` in `[0.0, 1.0]`.
+   - For the **INT8 model**: keep raw `uint8` values `[0, 255]`, do not
+     divide — the quantized model expects raw integer input.
+
+7. **Shape.** Final tensor shape `[1, 96, 96, 1]` — batch size 1, height 96,
+   width 96, 1 channel. Do not add fake RGB channels; the model was trained
+   on 1-channel input directly (channel tiling to 3 only happens *inside* the
+   Python model graph before the MobileNetV3 backbone, which was baked into
+   the exported model — Dart should not replicate that tiling itself).
+
+## 3. Critical: class index → Nepali character mapping
+
+The model's output index does **not** match the folder numbers 0–35 in
+numeric order, because the training script sorted folder names as strings,
+not integers. String-sorting `"0"`, `"1"`, ..., `"35"` gives an order where
+e.g. `"10"` comes before `"2"`. The verified index → folder-number → Nepali
+character mapping is below. **Use this table directly — do not regenerate it
+by assuming numeric order.**
+
+| Model output index | Folder number | Nepali character |
+|---|---|---|
+| 0 | 0 | क |
+| 1 | 1 | ख |
+| 2 | 10 | ट |
+| 3 | 11 | ठ |
+| 4 | 12 | ड |
+| 5 | 13 | ढ |
+| 6 | 14 | ण |
+| 7 | 15 | त |
+| 8 | 16 | थ |
+| 9 | 17 | द |
+| 10 | 18 | ध |
+| 11 | 19 | न |
+| 12 | 2 | ग |
+| 13 | 20 | प |
+| 14 | 21 | फ |
+| 15 | 22 | ब |
+| 16 | 23 | भ |
+| 17 | 24 | म |
+| 18 | 25 | य |
+| 19 | 26 | र |
+| 20 | 27 | ल |
+| 21 | 28 | व |
+| 22 | 29 | श |
+| 23 | 3 | घ |
+| 24 | 30 | ष |
+| 25 | 31 | स |
+| 26 | 32 | ह |
+| 27 | 33 | क्ष |
+| 28 | 34 | त्र |
+| 29 | 35 | ज्ञ |
+| 30 | 4 | ङ |
+| 31 | 5 | च |
+| 32 | 6 | छ |
+| 33 | 7 | ज |
+| 34 | 8 | झ |
+| 35 | 9 | ञ |
+
+Hardcode this exact list (index → character) in Dart as a lookup array. Do
+not derive it from `int.parse(folderName)` sorting logic — it must match the
+`sorted(set(...))` string-sort behavior of the Python training script.
+
+## 4. Output interpretation
+
+- Model output is a 36-length vector.
+- For the FP16 model: values are already softmax probabilities (sum to ~1.0);
+  take `argmax` for the predicted class, and the max value itself as
+  confidence.
+- For the INT8 model: raw output is quantized `uint8` — dequantize using
+  `(raw_value - zero_point) * scale` (get `zero_point`/`scale` from the
+  model's output tensor quantization parameters) before interpreting as a
+  probability. `argmax` on the raw quantized values still gives the correct
+  predicted class even without dequantizing, but confidence values need
+  dequantization to be meaningful.
+
+## 5. Things to double check in the existing Flutter code before wiring in the new model
+
+- Any old normalization (`/127.5 - 1.0` or similar) left over from the
+  previous model must be removed — this model expects `[0,1]` (FP16) or raw
+  `[0,255]` (INT8), not `[-1,1]`.
+- Any old RGB 3-channel input tensor shape must be changed to `[1,96,96,1]`.
+  A leftover 3-channel input allocation will cause a shape mismatch error or
+  silently misread memory — check `resizeInputTensor` / `allocateTensors`
+  calls reflect the new shape.
+- Confirm whichever crop the app currently uses (MediaPipe hand box vs.
+  adaptive-threshold bounding box) is the one described in step 4 above — if
+  the app crops via MediaPipe first and *then* runs steps 1–3 inside that
+  crop, that is a different pipeline than training, and needs to either be
+  changed to match, or explicitly reported back before proceeding, since it
+  changes what "the input" represents.

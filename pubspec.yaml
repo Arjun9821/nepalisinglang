@@ -1,0 +1,103 @@
+
+
+name: nsl_fyp
+description: "Nepali Sign Language Recognition - Final Year Project"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_riverpod: ^2.5.1
+
+  # Routing
+  go_router: ^14.2.0
+
+  # Fonts / Theming
+  google_fonts: ^6.2.1
+
+  # Camera
+  camera: ^0.12.0+1
+  # Forces the legacy Camera2-based Android implementation instead of the
+  # camera_android_camerax default — CameraX's startImageStream is known to
+  # crash-loop (repeated CameraDevice error codes 3/4/5) on some devices,
+  # including this project's test device.
+  camera_android: ^0.10.11
+  # MediaPipe HandLandmarker (21 landmarks x xyz). Android-only plugin; it is
+  # what drives the landmark-based NSL classifier (assets/nsl.tflite).
+  #
+  # Pinned to 3.0.0, NOT the spec's ^3.0.1: 3.0.1 raised its floor to
+  # Dart 3.12 / Flutter 3.44, and this project is on Dart 3.10.7 /
+  # Flutter 3.38.6. Per the plugin's changelog 3.0.1 is an SDK-constraint and
+  # built-in-Kotlin migration only, with no public API change, so
+  # HandLandmarkerPlugin.create / processFrame / landmarkStream / Hand /
+  # Landmark are identical. Bump this to ^3.0.1 only alongside a Flutter
+  # upgrade, and re-run the parity gate afterwards.
+  hand_landmarker: 3.0.0
+  permission_handler: ^11.3.1
+
+  # Networking (for future Online Mode API integration)
+  http: ^1.2.2
+
+  # Text to Speech
+  flutter_tts: ^4.0.2
+
+  # Image processing (for future frame conversion -> model / API)
+  image: ^4.2.0
+
+  # Local storage
+  path_provider: ^2.1.4
+  shared_preferences: ^2.3.2
+
+  # Value equality for models
+  equatable: ^2.0.5
+
+  cupertino_icons: ^1.0.8
+  tflite_flutter: ^0.12.1
+
+  # Direct (rather than transitive) so NslPreprocessor can mark its per-stage
+  # test hooks @visibleForTesting.
+  meta: ^1.15.0
+
+  # Sentence synthesis via Gemini, proxied by Firebase AI Logic so no API key
+  # is ever placed on the device (App Check attests the caller instead).
+  #
+  # Present but dormant: AppConfig.useFirebaseAiSynthesizer is false until
+  # `flutterfire configure` has been run and AI Logic enabled in the console,
+  # and main() only touches Firebase when that flag is on. Until then the app
+  # uses the direct Gemini REST backend, or the on-device join fallback.
+  firebase_core: ^4.13.0
+  firebase_ai: ^3.15.0
+  firebase_app_check: ^0.4.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  # Hosts the Section 6 parity gate on a real device: the TFLite interpreter
+  # needs native libs that the pure-Dart test VM does not provide.
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    # 96x96x1 float32 silhouette classifier -> 36 softmax probabilities.
+    # Labels are hardcoded in lib/core/utils/nsl_labels.dart, not shipped as an
+    # asset, because the class order is a string sort of dataset folder names.
+    - assets/models/nsl_single_fp16.tflite
+    - assets/models/palm_detection.tflite
+
+    # Landmark-based classifier: [1,78] float32 -> [1,36] float32 LOGITS.
+    # Labels / mu / sd / thresholds are read from meta.json at runtime and are
+    # deliberately NOT hardcoded (its label order differs from NslLabels).
+    - assets/nsl.tflite
+    - assets/meta.json
+    - assets/parity.json
+

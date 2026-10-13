@@ -1,0 +1,86 @@
+[
+  {
+    "name": "blob_640x480",
+    "width": 640,
+    "height": 480,
+    "grayscaleSource": true,
+    "box": [
+      0,
+      1,
+      462,
+      479
+    ]
+  },
+  {
+    "name": "noise_64x48",
+    "width": 64,
+    "height": 48,
+    "grayscaleSource": true,
+    "box": [
+      0,
+      0,
+      64,
+      48
+    ]
+  },
+  {
+    "name": "tiny_40x30",
+    "width": 40,
+    "height": 30,
+    "grayscaleSource": true,
+    "box": [
+      0,
+      0,
+      40,
+      30
+    ]
+  },
+  {
+    "name": "wide_300x60",
+    "width": 300,
+    "height": 60,
+    "grayscaleSource": true,
+    "box": [
+      0,
+      0,
+      300,
+      60
+    ]
+  },
+  {
+    "name": "tall_60x300",
+    "width": 60,
+    "height": 300,
+    "grayscaleSource": true,
+    "box": [
+      0,
+      0,
+      60,
+      300
+    ]
+  },
+  {
+    "name": "big_512x300",
+    "width": 512,
+    "height": 300,
+    "grayscaleSource": true,
+    "box": [
+      0,
+      0,
+      512,
+      300
+    ]
+  },
+  {
+    "name": "colour_160x200",
+    "width": 160,
+    "height": 200,
+    "grayscaleSource": false,
+    "box": [
+      0,
+      0,
+      160,
+      200
+    ]
+  }
+]

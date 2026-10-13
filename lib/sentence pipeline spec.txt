@@ -1,0 +1,502 @@
+# NSL Real-Time Sentence Formation — Architecture & Implementation Spec
+
+**Revision note:** this version removes the custom FastAPI/WebSocket backend. The LLM is called
+directly from the Flutter app using Firebase AI Logic (Gemini), with no server to host and no
+raw API key embedded in the app. See §12 for the trade-offs this involves.
+
+## 0. Context & Assumptions
+
+**Current state (existing implementation):**
+- Flutter Android app captures camera frames, uses MediaPipe to detect and crop the hand region.
+- Cropped hand image is fed to a TFLite MobileNetV3Small model (`tflite_flutter` 0.12.1), input shape `[1][96][96][1]` (grayscale, 96×96).
+- Per-frame `(predicted_char, confidence)` is written **directly** to an output textbox. No smoothing, no sentence formation.
+- A separate FastAPI + PyTorch backend exists for an "online mode" (server-side inference). That backend is untouched by this spec — the sentence-formation feature described here does not depend on it or route through it.
+
+**Assumptions made in this spec (adjust if wrong):**
+1. The 36 output classes correspond to Devanagari graphemes (Nepali alphabet). All LLM prompting below is written for Nepali sentence output — swap the prompt language if the label set is actually Latin/Romanized.
+2. The model performs **fingerspelling** recognition (discrete letters), not continuous-sign/gesture recognition.
+3. Camera pipeline runs at roughly 15–30 fps on-device; read actual fps at runtime rather than hardcoding it.
+
+**Design principle — graceful degradation:** the app must keep working with just the raw debounced letter stream if the LLM call fails (no internet, quota exhausted, App Check rejection, etc). The sentence layer is an enhancement, never a hard dependency for the core recognition feature.
+
+---
+
+## 1. Problem Breakdown
+
+| # | Problem | Where it's solved | Why |
+|---|---|---|---|
+| 1 | Frame-level noise (same char repeated 30x while held) | On-device, temporal stabilizer | Free, instant, more reliable than asking an LLM to guess which repeats were real |
+| 2 | Word/sentence boundary detection | On-device, idle/pause detection | No network call needed just to notice the hand stopped moving |
+| 3 | Turning a clean letter sequence into a grammatical sentence, fixing likely misrecognitions | On-device, direct Gemini call via Firebase AI Logic | The one thing that genuinely needs a language model |
+
+---
+
+## 2. Component Architecture
+
+```
+┌─────────────────────────────── ANDROID DEVICE (Flutter) ───────────────────────────────┐
+│                                                                                          │
+│  Camera ──▶ MediaPipe crop ──▶ TFLite MobileNetV3 ──▶ (char, confidence) per frame       │
+│                                                              │                           │
+│                                                              ▼                           │
+│                                                  ┌───────────────────────┐               │
+│                                                  │  Temporal Stabilizer  │               │
+│                                                  │  debounce + conf gate │               │
+│                                                  └───────────┬───────────┘               │
+│                                                              │ StabilizedEvent            │
+│                                                              ▼                           │
+│                                                  ┌───────────────────────┐               │
+│                                                  │ Buffer & Trigger Mgr  │               │
+│                                                  │ pause / size / manual │               │
+│                                                  └─────┬─────────────┬───┘               │
+│                                    raw stream          │             │ flush(raw_string)  │
+│                                    shown instantly      │             ▼                   │
+│                                             │            │   ┌───────────────────────┐    │
+│                                             │            │   │  On-Device LLM Client │    │
+│                                             │            │   │  (Firebase AI Logic)  │    │
+│                                             │            │   │  Gemini, App Check    │    │
+│                                             │            │   └───────────┬───────────┘    │
+│                                             ▼            │               │ sentence        │
+│                                   ┌───────────────────┐  │               ▼                │
+│                                   │   UI: raw stream   │  │   ┌───────────────────┐        │
+│                                   │   panel (existing, │  │   │  UI: sentence      │        │
+│                                   │   now debounced)   │  │   │  panel (new)       │        │
+│                                   └───────────────────┘  └──▶└───────────────────┘        │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+                                             │
+                                             ▼  HTTPS, authenticated via Firebase App Check
+                                   ┌───────────────────────┐
+                                   │  Gemini API (Google)   │
+                                   │  gemini-2.5-flash       │
+                                   └───────────────────────┘
+```
+
+No app-owned server anywhere in this path. Google's infrastructure is the only third party involved, and the request is authenticated by Play Integrity attestation rather than a key baked into the app.
+
+---
+
+## 3. On-Device: Temporal Stabilizer
+
+**Purpose:** collapse a noisy per-frame prediction stream into discrete, confident "letter confirmed" events, and detect idle gaps (which double as word/sentence boundary signals).
+
+**States:**
+- `IDLE` — no hand detected, or confidence below threshold.
+- `CANDIDATE` — a class appears; counting consecutive matching frames.
+- `HOLDING` — same class held for `K` consecutive frames above threshold → emit **one** `char_confirmed` event.
+
+**Transitions:**
+- `IDLE → CANDIDATE`: new frame with confidence ≥ `CONFIDENCE_THRESHOLD`.
+- `CANDIDATE → CANDIDATE`: same class, confidence holds → increment counter.
+- `CANDIDATE → IDLE`: class changes or confidence drops before reaching `K` → discard (transition motion, not a real letter).
+- `CANDIDATE → HOLDING`: counter reaches `K` → emit `char_confirmed`.
+- `HOLDING → IDLE`: hand disappears or confidence drops for `IDLE_GAP_MS` → reset; if the gap exceeds `WORD_BOUNDARY_MS`, also emit `word_boundary`.
+- `HOLDING → CANDIDATE`: class changes while still holding → immediately evaluate the new class as a fresh candidate.
+
+**Default parameters (tune against real fps):**
+
+| Param | Default | Meaning |
+|---|---|---|
+| `CONFIDENCE_THRESHOLD` | 0.80 | Minimum softmax confidence to count a frame |
+| `STABLE_FRAME_COUNT (K)` | ~= 300ms / frame_interval | Consecutive frames needed to confirm a letter |
+| `IDLE_GAP_MS` | 500 | No-hand/low-conf duration before resetting to IDLE |
+| `WORD_BOUNDARY_MS` | 1200 | Idle duration that implies a word boundary |
+| `SENTENCE_PAUSE_MS` | 2000 | Idle duration that implies "user is done with this utterance" |
+
+**Event contract:**
+
+```dart
+enum StabilizedEventType { charConfirmed, wordBoundary, sentencePause }
+
+class StabilizedEvent {
+  final StabilizedEventType type;
+  final String? char;
+  final double? confidence;
+  final int timestampMs;
+  StabilizedEvent({required this.type, this.char, this.confidence, required this.timestampMs});
+}
+```
+
+**Dart skeleton — `lib/nsl/temporal_stabilizer.dart`:**
+
+```dart
+enum _State { idle, candidate, holding }
+
+class TemporalStabilizer {
+  final double confidenceThreshold;
+  final int stableFrameCount;
+  final int idleGapMs;
+  final int wordBoundaryMs;
+
+  _State _state = _State.idle;
+  String? _candidateChar;
+  int _candidateCount = 0;
+  int _lastActiveTs = 0;
+  String? _lastEmittedChar;
+
+  TemporalStabilizer({
+    this.confidenceThreshold = 0.80,
+    this.stableFrameCount = 8,
+    this.idleGapMs = 500,
+    this.wordBoundaryMs = 1200,
+  });
+
+  StabilizedEvent? ingest(String? char, double confidence, int nowMs) {
+    final active = char != null && confidence >= confidenceThreshold;
+
+    if (!active) {
+      final gap = nowMs - _lastActiveTs;
+      if (_state != _State.idle && gap >= idleGapMs) {
+        _state = _State.idle;
+        _candidateChar = null;
+        _candidateCount = 0;
+        _lastEmittedChar = null;
+        if (gap >= wordBoundaryMs) {
+          return StabilizedEvent(type: StabilizedEventType.wordBoundary, timestampMs: nowMs);
+        }
+      }
+      return null;
+    }
+
+    _lastActiveTs = nowMs;
+
+    if (char != _candidateChar) {
+      _candidateChar = char;
+      _candidateCount = 1;
+      _state = _State.candidate;
+      return null;
+    }
+
+    _candidateCount++;
+    if (_candidateCount >= stableFrameCount && _lastEmittedChar != char) {
+      _state = _State.holding;
+      _lastEmittedChar = char;
+      return StabilizedEvent(
+        type: StabilizedEventType.charConfirmed,
+        char: char,
+        confidence: confidence,
+        timestampMs: nowMs,
+      );
+    }
+    return null;
+  }
+}
+```
+
+---
+
+## 4. On-Device: Buffer & Trigger Manager
+
+**Purpose:** decide *when* to actually call the LLM. Don't call it per character — call it per utterance. This is the biggest latency lever regardless of where the LLM call goes.
+
+**Trigger conditions (any one fires a flush):**
+1. `sentencePause` event from the stabilizer (idle ≥ `SENTENCE_PAUSE_MS`).
+2. Buffer reaches `MAX_BUFFER_CHARS` (default 30).
+3. User taps a manual "Done" / "Send" button.
+4. App goes to background / screen off.
+
+**Dart skeleton — `lib/nsl/buffer_manager.dart`:**
+
+```dart
+class SentenceBufferManager {
+  final int maxBufferChars;
+  final void Function(String rawBuffer) onFlush;
+
+  final List<String> _buffer = [];
+
+  SentenceBufferManager({this.maxBufferChars = 30, required this.onFlush});
+
+  void onStabilizedEvent(StabilizedEvent event) {
+    switch (event.type) {
+      case StabilizedEventType.charConfirmed:
+        _buffer.add(event.char!);
+        if (_buffer.length >= maxBufferChars) _flush();
+        break;
+      case StabilizedEventType.wordBoundary:
+        if (_buffer.isNotEmpty && _buffer.last != '|') _buffer.add('|');
+        break;
+      case StabilizedEventType.sentencePause:
+        _flush();
+        break;
+    }
+  }
+
+  void flushManually() => _flush();
+
+  void _flush() {
+    if (_buffer.isEmpty) return;
+    onFlush(_buffer.join());
+    _buffer.clear();
+  }
+}
+```
+
+`onFlush` now calls the LLM client's `synthesize()` method directly (§5) instead of sending over a socket.
+
+---
+
+## 5. On-Device: LLM Client (Firebase AI Logic)
+
+**Why Firebase AI Logic instead of a raw API key:** any string embedded in a Flutter app is trivially extractable from a release APK (`strings` on the binary, or unzip + inspect the compiled snapshot). Firebase AI Logic avoids this by never putting the key on-device at all — it proxies the call through Firebase, and authenticates the *caller* (your app, on a real device) using Firebase App Check with the Play Integrity provider on Android. As of mid-2026 App Check enforcement is on by default when you set up AI Logic. This is Google's current recommended path for calling Gemini directly from a mobile client, and it works on the no-cost Gemini Developer API tier — no billing account required.
+
+**Setup dependencies** (detailed steps in §8): a Firebase project linked to the app, `firebase_core` + `firebase_ai` + `firebase_app_check` packages, and App Check activated in `main()`.
+
+**Dart skeleton — `lib/nsl/sentence_synthesizer.dart`:**
+
+```dart
+import 'package:firebase_ai/firebase_ai.dart';
+
+class OnDeviceSentenceSynthesizer {
+  late final GenerativeModel _model;
+  final List<String> _history = [];
+
+  OnDeviceSentenceSynthesizer() {
+    _model = FirebaseAI.googleAI().generativeModel(
+      model: 'gemini-2.5-flash',
+      generationConfig: GenerationConfig(
+        temperature: 0.2,
+        maxOutputTokens: 80,
+      ),
+    );
+  }
+
+  /// Returns null on any failure — caller should fall back to raw-stream-only.
+  Future<String?> synthesize(String raw) async {
+    final prompt = _buildPrompt(raw);
+    try {
+      final response = await _model
+          .generateContent([Content.text(prompt)])
+          .timeout(const Duration(seconds: 4));
+      final sentence = response.text?.trim();
+      if (sentence != null && sentence.isNotEmpty) {
+        _history.add(sentence);
+        if (_history.length > 5) _history.removeAt(0);
+        return sentence;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void resetSession() => _history.clear();
+
+  String _buildPrompt(String raw) {
+    const examples = '''
+Input: न|म|स|त|े
+Output: नमस्ते।
+
+Input: म|क|ा|ठ|म|ा|ड|ौ|ं|ज|ा|न|छ|ु
+Output: म काठमाडौं जान्छु।''';
+
+    final context = _history.isEmpty
+        ? ''
+        : 'Previous sentences in this conversation:\n${_history.join('\n')}\n\n';
+
+    return '$_systemPrompt\n\n$examples\n\n${context}Input: $raw\nOutput:';
+  }
+
+  static const _systemPrompt = '''
+You are correcting a noisy stream of Nepali (Devanagari) letters produced by
+a sign-language fingerspelling recognizer. The letters may contain
+misrecognitions of visually similar hand shapes. Your job:
+
+1. Segment the letter stream into words (a '|' marks a likely word boundary,
+   but boundaries can be wrong — use judgement).
+2. Fix likely misrecognized letters based on context, choosing the most
+   probable real Nepali word.
+3. Produce one fluent, grammatical Nepali sentence.
+4. Use ONLY the information in the letter stream — do not invent unrelated
+   content. If the stream is too short or unclear, return your best-effort
+   phrase rather than refusing.
+
+Respond with the corrected sentence only. No explanation, no quotes.''';
+}
+```
+
+Wire it into the buffer manager:
+
+```dart
+final synthesizer = OnDeviceSentenceSynthesizer();
+
+final bufferManager = SentenceBufferManager(
+  onFlush: (raw) async {
+    final sentence = await synthesizer.synthesize(raw);
+    if (sentence != null) {
+      updateSentencePanel(sentence);
+    } else {
+      showSentenceUnavailableHint(); // raw panel already has the letters, nothing lost
+    }
+  },
+);
+```
+
+### Optional: Groq fallback (embedded key — read the caveat)
+
+Groq has no Firebase-style proxy, so a fallback call means embedding the key directly:
+
+```dart
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+
+class GroqFallbackSynthesizer {
+  final String apiKey;
+  GroqFallbackSynthesizer(this.apiKey);
+
+  Future<String?> synthesize(String prompt) async {
+    try {
+      final resp = await http.post(
+        Uri.parse('https://api.groq.com/openai/v1/chat/completions'),
+        headers: {
+          'Authorization': 'Bearer $apiKey',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'model': 'llama-3.3-70b-versatile',
+          'messages': [{'role': 'user', 'content': prompt}],
+          'temperature': 0.2,
+          'max_tokens': 80,
+        }),
+      ).timeout(const Duration(seconds: 4));
+      final data = jsonDecode(resp.body);
+      return (data['choices'][0]['message']['content'] as String).trim();
+    } catch (_) {
+      return null;
+    }
+  }
+}
+```
+
+**Caveat:** this key *is* extractable from the compiled APK. For a free-tier key on an academic project this is a low-stakes risk (worst case someone burns your free quota), but don't reuse a key that's also used anywhere sensitive, and don't treat this as a pattern to carry into a production app. Given Gemini via Firebase AI Logic already has its own retry/timeout handling, you may not need this fallback at all — consider skipping it and just showing "sentence unavailable, here's your raw stream" on failure instead, which keeps the whole app key-free.
+
+---
+
+## 6. On-Device: UI Changes
+
+Split the existing single output textbox into two regions:
+
+1. **Raw stream panel** (existing widget, now fed debounced text): updates *instantly* on every `charConfirmed` event, independent of any network call.
+2. **Sentence panel** (new): shows the latest synthesized sentence. Placeholder ("…") while `synthesize()` is in flight; falls back to a small "couldn't refine — showing raw only" hint on failure rather than staying blank forever.
+
+Add a "Done" button that calls `bufferManager.flushManually()`.
+
+---
+
+## 7. Config Defaults
+
+| Param | Default |
+|---|---|
+| `CONFIDENCE_THRESHOLD` | 0.80 |
+| `STABLE_FRAME_COUNT` | ~8 (tune to fps) |
+| `IDLE_GAP_MS` | 500 |
+| `WORD_BOUNDARY_MS` | 1200 |
+| `SENTENCE_PAUSE_MS` | 2000 |
+| `MAX_BUFFER_CHARS` | 30 |
+| `LLM_TIMEOUT_S` | 4 |
+| `LLM_TEMPERATURE` | 0.2 |
+| `LLM_MAX_TOKENS` | 80 |
+| Conversation history length | last 5 sentences, cleared on app restart or `resetSession()` |
+
+---
+
+## 8. Firebase / Gemini Setup Steps
+
+1. Install the Firebase CLI and FlutterFire CLI if not already present, then run `flutterfire configure` inside the project — this creates/links a Firebase project and generates `firebase_options.dart`.
+2. Add packages: `flutter pub add firebase_core firebase_ai firebase_app_check`.
+3. In `main()`, before `runApp`:
+   ```dart
+   WidgetsFlutterBinding.ensureInitialized();
+   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+   await FirebaseAppCheck.instance.activate(
+     androidProvider: AndroidProvider.playIntegrity,
+   );
+   ```
+4. In the Firebase console, open **Build → AI Logic**, follow the setup flow, and choose the **Gemini Developer API** backend (no-cost tier, no billing account needed) rather than the Vertex/Enterprise backend.
+5. App Check is enforced automatically as part of that setup flow. For local development on a debug build/emulator, register the **App Check debug provider** token shown in your logcat output the first time you run the app, or calls will be rejected.
+6. That's it — no server to deploy, no key to rotate.
+
+If you do add the optional Groq fallback: create a free key at the Groq console and store it via a build-time constant (e.g. `--dart-define`) rather than hardcoding it in source, so it's at least not sitting in version control.
+
+---
+
+## 9. End-to-End Runtime Sequence
+
+1. User signs a letter → camera frame → MediaPipe crop → TFLite → `(char, confidence)`.
+2. Stabilizer ingests the frame; after `K` consistent frames, emits `charConfirmed`.
+3. Buffer manager appends the char, raw stream panel updates immediately.
+4. User pauses ≥ `SENTENCE_PAUSE_MS` → stabilizer emits `sentencePause` → buffer manager flushes.
+5. `OnDeviceSentenceSynthesizer.synthesize()` builds the prompt and calls Gemini via Firebase AI Logic.
+6. Firebase App Check attests the request; Gemini returns a sentence within the 4s timeout.
+7. Sentence panel updates. Raw stream panel is untouched throughout — nothing the user already sees jumps around.
+
+---
+
+## 10. Step-by-Step Implementation Guide (for Claude Code)
+
+**Phase 1 — Firebase project setup**
+- Run `flutterfire configure`, add the three packages, wire `Firebase.initializeApp()` + `FirebaseAppCheck.instance.activate()` into `main()`.
+- Enable AI Logic + Gemini Developer API backend in the Firebase console.
+- Acceptance: app builds and runs with no Firebase-related errors; a throwaway `_model.generateContent([Content.text("say hi")])` call succeeds and prints a response.
+
+**Phase 2 — Temporal stabilizer**
+- Add `lib/nsl/temporal_stabilizer.dart`.
+- Unit test with synthetic frame sequences (e.g. feed repeated identical chars and assert exactly one `charConfirmed`; feed short noise bursts shorter than `K` and assert none).
+
+**Phase 3 — Buffer & trigger manager**
+- Add `lib/nsl/buffer_manager.dart`.
+- Unit test each trigger condition independently (pause, max length, manual flush).
+
+**Phase 4 — LLM client**
+- Add `lib/nsl/sentence_synthesizer.dart` as in §5.
+- Manually test `synthesize()` with a few hand-typed raw strings, confirm plausible Nepali sentences come back and that a forced timeout/no-network case returns `null` cleanly instead of throwing.
+
+**Phase 5 — Wire the pipeline together**
+- Replace the current "write prediction directly to textbox" call site with: `TFLite output → stabilizer.ingest() → bufferManager.onStabilizedEvent()`.
+- Raw stream panel subscribes to `charConfirmed` events directly.
+- `bufferManager`'s `onFlush` calls `synthesizer.synthesize()` and updates the sentence panel per §5's wiring example.
+
+**Phase 6 — UI**
+- Split the textbox into raw-stream panel + sentence panel (§6).
+- Add the manual "Done" button and the "couldn't refine" fallback hint.
+
+**Phase 7 — End-to-end test on device**
+- Sign a short known phrase slowly. Confirm: raw panel updates letter-by-letter with no duplicate flicker; sentence panel updates within a couple seconds after pausing; turning off wifi degrades gracefully to raw-only with the fallback hint, no crash.
+
+**Phase 8 — Tuning pass**
+- Log actual on-device fps, adjust `STABLE_FRAME_COUNT` so hold time lands around 250–400ms.
+- Adjust `IDLE_GAP_MS` / `WORD_BOUNDARY_MS` / `SENTENCE_PAUSE_MS` against real signing rhythm to avoid false boundary triggers.
+
+---
+
+## 11. Testing & Validation Checklist
+
+- [ ] Holding one letter steadily for 3+ seconds produces exactly one `charConfirmed` event.
+- [ ] Rapid, noisy transition frames between letters never produce a spurious `charConfirmed`.
+- [ ] Buffer flush never sends an empty string.
+- [ ] `synthesize()` returns `null` (not an exception) on timeout, no network, or App Check rejection — verified by testing in airplane mode.
+- [ ] Sentence panel never blocks or delays the raw stream panel.
+- [ ] Conversation history caps at 5 sentences and clears on `resetSession()`.
+- [ ] No API key of any kind appears in the compiled APK (`strings app-release.apk | grep -i key` finds nothing meaningful) — if the optional Groq fallback is included, confirm this check explicitly fails there and that you've accepted that trade-off.
+- [ ] App Check debug provider is configured for local dev, so calls aren't silently rejected during development.
+
+---
+
+## 12. Trade-offs: Direct-from-Device vs. Custom Backend
+
+| | Direct (this version) | Custom backend (previous version) |
+|---|---|---|
+| Hosting | None needed | You run/maintain a server |
+| Key exposure | None (Firebase AI Logic handles auth) | Keys held server-side, never on device |
+| Latency | One fewer network hop | Extra hop through your own server |
+| Multi-user rate limiting | Shared Firebase project quota across all installs | You control quota/allocation per user |
+| Swapping providers/prompts | Requires an app release | Change server-side, no app update |
+| Groq fallback | Only via embedded key (see caveat in §5) | Key stays server-side, fully hidden |
+
+For a single-developer FYP with a handful of test devices, the direct approach is the reasonable default — it's simpler to build, has one fewer moving part to demo/debug, and Firebase AI Logic already solves the one security problem (raw key exposure) that direct-from-device calls usually have. Revisit a backend later only if you need centralized control across many simultaneous users, which isn't the case for a thesis demo.
+
+---
+
+## 13. Explicitly Out of Scope for This Iteration
+
+- Continuous/non-fingerspelled sign recognition (would need a different model).
+- Any backend server for this feature (deliberately removed — see §12).
+- Multi-user/multi-device session merging.
